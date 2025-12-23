@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>High-Fidelity Gesture Tree</title>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: radial-gradient(circle at center, #1b2735 0%, #090a0f 100%);
+            font-family: sans-serif;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+
+        /* Minimal Color Picker */
+        #picker-container {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            z-index: 20;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 8px;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        #picker-container:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        input[type="color"] {
+            -webkit-appearance: none;
+            border: none;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            cursor: pointer;
+            padding: 0;
+            background: none;
+            display: block;
+        }
+
+        input[type="color"]::-webkit-color-swatch-wrapper {
+            padding: 0;
+        }
+
+        input[type="color"]::-webkit-color-swatch {
+            border: 2px solid rgba(255, 255, 255, 0.5);
+            border-radius: 50%;
+        }
+
+        /* Hidden Video */
+        #input_video {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00ffaa;
+            font-size: 1rem;
+            z-index: 100;
+            pointer-events: none;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="loading">Planting Tree...</div>
+
+    <div id="picker-container" title="Change Foliage Color">
+        <input type="color" id="colorPicker" value="#00ff88">
+    </div>
+
+    <video id="input_video" autoplay playsinline></video>
+    <div id="canvas-container"></div>
+
+    <script>
+        // --- CONFIGURATION ---
+        const CONFIG = {
+            leafCount: 14000,      // Number of green particles
+            decorCount: 1200,      // Number of ornaments/lights
+            lightCount: 400,       // Fairy lights on garlands
+            ornamentCount: 60,     // 3D sphere ornaments
+            height: 40,            // Taller
+            baseRadius: 15,
+            layers: 10,            // More branches
+            yOffset: 0,            // Vertical shift (handled in geometry)
+            expandRadius: 50,
+            garlandSpirals: 3,     // Number of garland wraps
+            glowParticles: 200     // Ambient glow particles
+        };
+
+        let state = {
+            expansion: 0,
+            targetExpansion: 0,
+            leafColor: new THREE.Color('#44ffaa')
+        };
+
+        // --- THREE.JS SETUP ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#1b2735');
+        scene.fog = new THREE.FogExp2(0x1b2735, 0.015);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+        // Moved camera LOWER (y=5) and closer to look UP at the tree, making it feel taller
+        camera.position.set(0, 5, 50);
+        camera.lookAt(0, 8, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        // --- TEXTURES ---
+        function getTexture(softness) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32; canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(softness, 'rgba(255,255,255,0.2)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 32, 32);
+            return new THREE.Texture(canvas);
+        }
+        const leafTexture = getTexture(0.5); // Soft fuzz
+        const decorTexture = getTexture(0.1); // Sharp bright light
+        leafTexture.needsUpdate = true;
+        decorTexture.needsUpdate = true;
+
+        // --- HELPER: SPHERE EXPLOSION CALC ---
+        function getExplosionPos(index, total) {
+            const phi = Math.acos(-1 + (2 * index) / total);
+            const theta = Math.sqrt(total * Math.PI) * phi;
+            const r = CONFIG.expandRadius + (Math.random() * 10);
+            return {
+                x: r * Math.cos(theta) * Math.sin(phi),
+                y: r * Math.sin(theta) * Math.sin(phi),
+                z: r * Math.cos(phi)
+            };
+        }
+
+        // --- SYSTEM 1: FOLIAGE (LEAVES) ---
+        const leafGeo = new THREE.BufferGeometry();
+        const lPos = [], lTarget = [], lExpand = [];
+
+        for (let i = 0; i < CONFIG.leafCount; i++) {
+            // Tree Shape Logic
+            const hRatio = 1 - Math.pow(Math.random(), 0.7); // Bias toward bottom
+            const yRaw = hRatio * CONFIG.height;
+
+            // Sawtooth profile for branches
+            const layerProgress = (yRaw / CONFIG.height) * CONFIG.layers;
+            const segmentT = layerProgress % 1;
+            let maxR = (1 - (yRaw / CONFIG.height)) * CONFIG.baseRadius;
+            let r = maxR * (0.2 + 0.8 * segmentT) * Math.sqrt(Math.random()); // Volume fill
+
+            const angle = Math.random() * Math.PI * 2;
+            const x = Math.cos(angle) * r;
+            const z = Math.sin(angle) * r;
+            // Shift Y UP by 8 units to fix "too low" issue
+            const y = yRaw - (CONFIG.height / 2) + 8;
+
+            lTarget.push(x, y, z);
+            lPos.push(x, y, z);
+
+            const exp = getExplosionPos(i, CONFIG.leafCount);
+            lExpand.push(exp.x, exp.y, exp.z);
+        }
+
+        leafGeo.setAttribute('position', new THREE.Float32BufferAttribute(lPos, 3));
+        leafGeo.userData = { targets: lTarget, expands: lExpand };
+
+        const leafMat = new THREE.PointsMaterial({
+            color: state.leafColor,
+            size: 0.45, // Small particles for leaves
+            map: leafTexture,
+            transparent: true,
+            opacity: 0.85,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+        const foliageSystem = new THREE.Points(leafGeo, leafMat);
+        scene.add(foliageSystem);
+
+
+        // --- SYSTEM 2: DECORATIONS (LIGHTS & ORNAMENTS) ---
+        const decorGeo = new THREE.BufferGeometry();
+        const dPos = [], dTarget = [], dExpand = [], dColor = [];
+
+        const cRed = new THREE.Color(0xff5577);
+        const cGold = new THREE.Color(0xffaa00);
+        const cBlue = new THREE.Color(0x66bbff);
+        const cWhite = new THREE.Color(0xffffff);
+
+        for (let i = 0; i < CONFIG.decorCount; i++) {
+            // Decide type: 0=Garland/Light, 1=Star
+            let isStar = (i < 50); // First 50 particles are the Star
+
+            let x, y, z, col;
+
+            if (isStar) {
+                // Star Cluster at top
+                y = (CONFIG.height / 2) + 8.5 + (Math.random() * 1.5); // Very top
+                const r = Math.random() * 1.5;
+                const ang = Math.random() * Math.PI * 2;
+                x = Math.cos(ang) * r * (1 - (y - (CONFIG.height / 2 + 8.5)) / 1.5); // Cone tip
+                z = Math.sin(ang) * r;
+                col = cWhite;
+            } else {
+                // Ornaments - Placed on OUTER edges of branches
+                const hRatio = Math.random();
+                const yRaw = hRatio * CONFIG.height;
+
+                // Exact branch tip calculation
+                const layerProgress = (yRaw / CONFIG.height) * CONFIG.layers;
+                const segmentT = layerProgress % 1;
+                // Bias segmentT > 0.6 so they sit on the tips
+                const tipBias = 0.6 + (Math.random() * 0.4);
+
+                let maxR = (1 - (yRaw / CONFIG.height)) * CONFIG.baseRadius;
+                // Place mostly on surface
+                let r = maxR * (0.2 + 0.8 * tipBias);
+
+                const angle = Math.random() * Math.PI * 2 + (yRaw * 0.5); // Slight spiral
+                x = Math.cos(angle) * r;
+                z = Math.sin(angle) * r;
+                y = yRaw - (CONFIG.height / 2) + 8;
+
+                // Color Logic
+                const seed = Math.random();
+                if (seed < 0.4) col = cGold;
+                else if (seed < 0.7) col = cRed;
+                else col = cBlue;
+            }
+
+            dTarget.push(x, y, z);
+            dPos.push(x, y, z);
+            dColor.push(col.r, col.g, col.b);
+
+            const exp = getExplosionPos(i, CONFIG.decorCount);
+            dExpand.push(exp.x, exp.y, exp.z);
+        }
+
+        decorGeo.setAttribute('position', new THREE.Float32BufferAttribute(dPos, 3));
+        decorGeo.setAttribute('color', new THREE.Float32BufferAttribute(dColor, 3));
+        decorGeo.userData = { targets: dTarget, expands: dExpand };
+
+        const decorMat = new THREE.PointsMaterial({
+            size: 0.9, // Much BIGGER particles for decorations
+            map: decorTexture,
+            vertexColors: true,
+            transparent: true,
+            opacity: 1.0, // Brighter
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+        const decorSystem = new THREE.Points(decorGeo, decorMat);
+        scene.add(decorSystem);
+
+
+        // --- SYSTEM 3: 3D STAR TOPPER ---
+        function createStarShape() {
+            const shape = new THREE.Shape();
+            const outerRadius = 2.0;
+            const innerRadius = 0.8;
+            const spikes = 5;
+
+            for (let i = 0; i < spikes * 2; i++) {
+                const radius = i % 2 === 0 ? outerRadius : innerRadius;
+                const angle = (i * Math.PI) / spikes - Math.PI / 2;
+                const x = Math.cos(angle) * radius;
+                const y = Math.sin(angle) * radius;
+                if (i === 0) shape.moveTo(x, y);
+                else shape.lineTo(x, y);
+            }
+            shape.closePath();
+            return shape;
+        }
+
+        const starShape = createStarShape();
+        const starExtrudeSettings = { depth: 0.5, bevelEnabled: true, bevelThickness: 0.1, bevelSize: 0.1, bevelSegments: 2 };
+        const starGeometry = new THREE.ExtrudeGeometry(starShape, starExtrudeSettings);
+        starGeometry.center();
+
+        const starMaterial = new THREE.MeshStandardMaterial({
+            color: 0xffd700,
+            emissive: 0xffaa00,
+            emissiveIntensity: 0.8,
+            metalness: 0.9,
+            roughness: 0.2
+        });
+        const starMesh = new THREE.Mesh(starGeometry, starMaterial);
+        starMesh.castShadow = true;
+        starMesh.receiveShadow = false;
+        starMesh.position.set(0, CONFIG.height / 2 + 10, 0);
+        starMesh.rotation.x = Math.PI * 0.1;
+        scene.add(starMesh);
+
+        // Star glow halo
+        const starGlowTexture = getTexture(0.3);
+        starGlowTexture.needsUpdate = true;
+        const starGlowMat = new THREE.SpriteMaterial({
+            map: starGlowTexture,
+            color: 0xffd700,
+            transparent: true,
+            opacity: 0.6,
+            blending: THREE.AdditiveBlending
+        });
+        const starGlow = new THREE.Sprite(starGlowMat);
+        starGlow.scale.set(12, 12, 1);
+        starGlow.position.copy(starMesh.position);
+        scene.add(starGlow);
+
+        // Add lighting for the star and ornaments
+        // Reduced intensity to fix washout
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        // Soft ground fill
+        const hemiLight = new THREE.HemisphereLight(0xffffff, 0x666666, 0.6);
+        scene.add(hemiLight);
+
+        // Moonlight for Shadows
+        const dirLight = new THREE.DirectionalLight(0xaaccff, 0.8);
+        dirLight.position.set(20, 50, 20);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 100;
+        dirLight.shadow.camera.left = -30;
+        dirLight.shadow.camera.right = 30;
+        dirLight.shadow.camera.top = 30;
+        dirLight.shadow.camera.bottom = -30;
+        scene.add(dirLight);
+
+        // Invisible Shadow Floor
+        const floorGeo = new THREE.PlaneGeometry(200, 200);
+        const floorMat = new THREE.ShadowMaterial({ opacity: 0.3 });
+        const floor = new THREE.Mesh(floorGeo, floorMat);
+        floor.rotation.x = -Math.PI / 2;
+        floor.position.y = CONFIG.height / -2 + 8; // Match tree bottom
+        floor.receiveShadow = true;
+        scene.add(floor);
+
+        // Fake Tree Shadow Blob (Gradient Texture on Plane)
+        const shadowTexture = getTexture(0.5); // Reuse gradient texture
+        const blobMat = new THREE.MeshBasicMaterial({
+            map: shadowTexture,
+            color: 0x000000,
+            transparent: true,
+            opacity: 0.8,
+            depthWrite: false
+        });
+        const blob = new THREE.Mesh(new THREE.PlaneGeometry(25, 25), blobMat);
+        blob.rotation.x = -Math.PI / 2;
+        blob.position.y = CONFIG.height / -2 + 8.1; // Slightly above floor to avoid z-fight
+        scene.add(blob);
+
+
+        const starLight = new THREE.PointLight(0xffd700, 1, 30);
+        starLight.position.copy(starMesh.position);
+        scene.add(starLight);
+
+
+        // --- SYSTEM 4: FAIRY LIGHTS ON SPIRAL GARLANDS ---
+        const garlandGeo = new THREE.BufferGeometry();
+        const gPos = [], gTarget = [], gExpand = [], gColor = [], gFlicker = [];
+
+        // Warm color palette for fairy lights
+        const warmColors = [
+            new THREE.Color(0xfffaf0), // Warm white
+            new THREE.Color(0xffd700), // Gold
+            new THREE.Color(0xffb347), // Pastel orange
+            new THREE.Color(0xffe4b5), // Moccasin
+            new THREE.Color(0xffefd5), // Papaya whip
+        ];
+        const accentColors = [
+            new THREE.Color(0xff6b6b), // Soft red
+            new THREE.Color(0x4ecdc4), // Teal
+        ];
+
+        for (let s = 0; s < CONFIG.garlandSpirals; s++) {
+            const spiralOffset = (s / CONFIG.garlandSpirals) * Math.PI * 2;
+            const lightsPerSpiral = Math.floor(CONFIG.lightCount / CONFIG.garlandSpirals);
+
+            for (let i = 0; i < lightsPerSpiral; i++) {
+                const t = i / lightsPerSpiral;
+                const y = t * CONFIG.height - CONFIG.height / 2 + 8;
+                const radiusAtHeight = (1 - t) * CONFIG.baseRadius * 0.95;
+                const angle = spiralOffset + t * Math.PI * 2 * 4; // 4 wraps per spiral
+
+                const x = Math.cos(angle) * radiusAtHeight;
+                const z = Math.sin(angle) * radiusAtHeight;
+
+                gTarget.push(x, y, z);
+                gPos.push(x, y, z);
+
+                // 80% warm, 20% accent colors
+                const col = Math.random() < 0.8
+                    ? warmColors[Math.floor(Math.random() * warmColors.length)]
+                    : accentColors[Math.floor(Math.random() * accentColors.length)];
+                gColor.push(col.r, col.g, col.b);
+
+                // Per-light flicker: [phase, speed, minBrightness]
+                gFlicker.push(Math.random() * Math.PI * 2, 0.5 + Math.random() * 2, 0.4 + Math.random() * 0.4);
+
+                const exp = getExplosionPos(s * lightsPerSpiral + i, CONFIG.lightCount);
+                gExpand.push(exp.x, exp.y, exp.z);
+            }
+        }
+
+        garlandGeo.setAttribute('position', new THREE.Float32BufferAttribute(gPos, 3));
+        garlandGeo.setAttribute('color', new THREE.Float32BufferAttribute(gColor, 3));
+        garlandGeo.userData = { targets: gTarget, expands: gExpand, flicker: gFlicker };
+
+        const garlandMat = new THREE.PointsMaterial({
+            size: 0.6,
+            map: decorTexture,
+            vertexColors: true,
+            transparent: true,
+            opacity: 1.2, // Boosted brightness
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+        const garlandSystem = new THREE.Points(garlandGeo, garlandMat);
+        scene.add(garlandSystem);
+
+
+        // --- SYSTEM 5: 3D METALLIC ORNAMENTS ---
+        const ornamentGroup = new THREE.Group();
+        const ornamentData = [];
+
+        const ornamentColors = [
+            { color: 0xff4444, metalness: 0.8, roughness: 0.2 }, // Red
+            { color: 0xffd700, metalness: 0.9, roughness: 0.1 }, // Gold
+            { color: 0x4488ff, metalness: 0.8, roughness: 0.2 }, // Blue
+            { color: 0xe0e0e0, metalness: 1.0, roughness: 0.1 }, // Silver
+            { color: 0xff6666, metalness: 0.7, roughness: 0.3 }, // Dark red -> Light red
+            { color: 0x44cc44, metalness: 0.6, roughness: 0.3 }, // Forest green -> Light green
+        ];
+
+        for (let i = 0; i < CONFIG.ornamentCount; i++) {
+            const hRatio = 0.1 + Math.random() * 0.8; // Avoid very top/bottom
+            const yRaw = hRatio * CONFIG.height;
+            const y = yRaw - CONFIG.height / 2 + 8;
+
+            const maxR = (1 - hRatio) * CONFIG.baseRadius * 0.85;
+            const angle = Math.random() * Math.PI * 2;
+            const r = maxR * (0.7 + Math.random() * 0.3);
+
+            const x = Math.cos(angle) * r;
+            const z = Math.sin(angle) * r;
+
+            const size = 0.4 + Math.random() * 0.4;
+            const sphereGeo = new THREE.SphereGeometry(size, 16, 16);
+            const colorData = ornamentColors[Math.floor(Math.random() * ornamentColors.length)];
+
+            const sphereMat = new THREE.MeshStandardMaterial({
+                color: colorData.color,
+                metalness: colorData.metalness,
+                roughness: colorData.roughness,
+                envMapIntensity: 1.0,
+                emissive: colorData.color,
+                emissiveIntensity: 0.2
+            });
+
+            const ornament = new THREE.Mesh(sphereGeo, sphereMat);
+            ornament.castShadow = true;
+            ornament.receiveShadow = false;
+            ornament.position.set(x, y - size * 0.5, z); // Hang slightly below
+
+            // Add small cap on top
+            const capGeo = new THREE.CylinderGeometry(size * 0.2, size * 0.3, size * 0.2, 8);
+            const capMat = new THREE.MeshStandardMaterial({ color: 0xc0c0c0, metalness: 0.9, roughness: 0.1 });
+            const cap = new THREE.Mesh(capGeo, capMat);
+            cap.position.y = size;
+            ornament.add(cap);
+
+            ornamentGroup.add(ornament);
+
+            const exp = getExplosionPos(i, CONFIG.ornamentCount);
+            ornamentData.push({
+                mesh: ornament,
+                target: new THREE.Vector3(x, y - size * 0.5, z),
+                expand: new THREE.Vector3(exp.x, exp.y, exp.z)
+            });
+        }
+        scene.add(ornamentGroup);
+
+
+        // --- SYSTEM 6: AMBIENT GLOW AURA ---
+        const glowGeo = new THREE.BufferGeometry();
+        const glowPos = [], glowTarget = [], glowExpand = [], glowColor = [];
+
+        for (let i = 0; i < CONFIG.glowParticles; i++) {
+            const y = Math.random() * CONFIG.height - CONFIG.height / 2 + 8;
+            const maxR = (1 - (y - 8 + CONFIG.height / 2) / CONFIG.height) * CONFIG.baseRadius;
+            const angle = Math.random() * Math.PI * 2;
+            const r = maxR * (1.2 + Math.random() * 0.5); // Outside the tree
+
+            const x = Math.cos(angle) * r;
+            const z = Math.sin(angle) * r;
+
+            glowTarget.push(x, y, z);
+            glowPos.push(x, y, z);
+
+            // Warm glow colors
+            const col = warmColors[Math.floor(Math.random() * warmColors.length)];
+            glowColor.push(col.r, col.g, col.b);
+
+            const exp = getExplosionPos(i, CONFIG.glowParticles);
+            glowExpand.push(exp.x * 1.5, exp.y * 1.5, exp.z * 1.5);
+        }
+
+        glowGeo.setAttribute('position', new THREE.Float32BufferAttribute(glowPos, 3));
+        glowGeo.setAttribute('color', new THREE.Float32BufferAttribute(glowColor, 3));
+        glowGeo.userData = { targets: glowTarget, expands: glowExpand };
+
+        const glowMat = new THREE.PointsMaterial({
+            size: 3.0,
+            map: leafTexture,
+            vertexColors: true,
+            transparent: true,
+            opacity: 0.4, // Stronger glow
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+        const glowSystem = new THREE.Points(glowGeo, glowMat);
+        scene.add(glowSystem);
+
+
+        // --- SYSTEM 7: GIFT BOXES (Under the Tree) ---
+        const giftGroup = new THREE.Group();
+        const giftData = [];
+        const giftCount = 12;
+
+        function createGift(x, z) {
+            const group = new THREE.Group();
+
+            // Random Box Size
+            const w = 2.0 + Math.random();
+            const h = 1.5 + Math.random();
+            const d = 2.0 + Math.random();
+
+            // Box Color (Bright Pastels)
+            const colors = [0xff5555, 0x55ff55, 0x5555ff, 0xffff55, 0xff55ff, 0x55ffff];
+            const col = colors[Math.floor(Math.random() * colors.length)];
+
+            const boxGeo = new THREE.BoxGeometry(w, h, d);
+            const boxMat = new THREE.MeshStandardMaterial({ color: col, roughnes: 0.3, metalness: 0.1 });
+            const box = new THREE.Mesh(boxGeo, boxMat);
+            box.castShadow = true;
+            box.receiveShadow = true;
+            box.position.y = h / 2;
+            group.add(box);
+
+            // Ribbon (Vertical & Horizontal)
+            const ribMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x222222 });
+            const ribW = 0.3;
+            const rib1 = new THREE.Mesh(new THREE.BoxGeometry(w + 0.1, h + 0.1, ribW), ribMat);
+            rib1.position.y = h / 2;
+            group.add(rib1);
+
+            const rib2 = new THREE.Mesh(new THREE.BoxGeometry(ribW, h + 0.1, d + 0.1), ribMat);
+            rib2.position.y = h / 2;
+            group.add(rib2);
+
+            group.position.set(x, CONFIG.height / -2 + 8, z); // Place on ground
+            group.rotation.y = Math.random() * Math.PI;
+            return group;
+        }
+
+        for (let i = 0; i < giftCount; i++) {
+            const angle = (i / giftCount) * Math.PI * 2 + Math.random();
+            const r = CONFIG.baseRadius * 0.8 + Math.random() * 5;
+            const x = Math.cos(angle) * r;
+            const z = Math.sin(angle) * r;
+            const gift = createGift(x, z);
+            giftGroup.add(gift);
+
+            // Track for animation
+            const exp = getExplosionPos(i + 100, giftCount + 100);
+            giftData.push({
+                mesh: gift,
+                target: gift.position.clone(),
+                expand: new THREE.Vector3(exp.x * 1.5, exp.y - 10, exp.z * 1.5)
+            });
+        }
+        scene.add(giftGroup);
+
+
+        // --- SYSTEM 8: STOCKINGS (SOCKS) Hanging on Branches ---
+        const sockGroup = new THREE.Group();
+        const sockData = [];
+        const sockCount = 12;
+
+        function createSock() {
+            const group = new THREE.Group();
+
+            // Red Leg
+            const legGeo = new THREE.CylinderGeometry(0.3, 0.25, 1.2, 12);
+            const redMat = new THREE.MeshStandardMaterial({ color: 0xff3333, roughness: 0.8 });
+            const leg = new THREE.Mesh(legGeo, redMat);
+            leg.castShadow = true;
+            group.add(leg);
+
+            // White Cuff
+            const cuffGeo = new THREE.CylinderGeometry(0.35, 0.35, 0.4, 12);
+            const whiteMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1.0 });
+            const cuff = new THREE.Mesh(cuffGeo, whiteMat);
+            cuff.castShadow = true;
+            cuff.position.y = 0.6;
+            group.add(cuff);
+
+            // Foot (Rotated cylinder/capsule approx)
+            const footGeo = new THREE.CylinderGeometry(0.26, 0.3, 0.8, 12);
+            const foot = new THREE.Mesh(footGeo, redMat);
+            foot.castShadow = true;
+            foot.rotation.z = Math.PI / 3;
+            foot.position.set(0.3, -0.6, 0);
+            group.add(foot);
+
+            // Toe (Sphere)
+            const toeGeo = new THREE.SphereGeometry(0.3, 12, 12);
+            const toe = new THREE.Mesh(toeGeo, whiteMat);
+            toe.castShadow = true;
+            toe.position.set(0.65, -0.8, 0);
+            group.add(toe);
+
+            return group;
+        }
+
+        for (let i = 0; i < sockCount; i++) {
+            // Place mid-tree
+            const hRatio = 0.3 + Math.random() * 0.4;
+            const yRaw = hRatio * CONFIG.height;
+            const y = yRaw - CONFIG.height / 2 + 8;
+
+            const maxR = (1 - hRatio) * CONFIG.baseRadius;
+            const r = maxR * 0.9;
+            const angle = Math.random() * Math.PI * 2;
+
+            const x = Math.cos(angle) * r;
+            const z = Math.sin(angle) * r;
+
+            const sock = createSock();
+            sock.position.set(x, y, z);
+            // Rotate to hang naturally?
+            sock.rotation.z = 0.2;
+            sock.rotation.y = angle + Math.PI / 2; // Face outward
+
+            sockGroup.add(sock);
+
+            // Track for animation
+            const exp = getExplosionPos(i + 200, sockCount + 200);
+            sockData.push({
+                mesh: sock,
+                target: sock.position.clone(),
+                expand: new THREE.Vector3(exp.x, exp.y, exp.z)
+            });
+        }
+        scene.add(sockGroup);
+
+
+        // --- ANIMATION ---
+        const clock = new THREE.Clock();
+        let sparkleTimer = 0;
+        const sparkleIndices = new Set();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            // Interaction Smoothing
+            const smoothFactor = 4.0 * delta;
+            state.expansion += (state.targetExpansion - state.expansion) * smoothFactor;
+
+            // Rotation - sync all systems
+            const rotationY = time * 0.05;
+            foliageSystem.rotation.y = rotationY;
+            decorSystem.rotation.y = rotationY;
+            garlandSystem.rotation.y = rotationY;
+            ornamentGroup.rotation.y = rotationY;
+            giftGroup.rotation.y = rotationY; // Decor on ground rotates with tree or separate? Let's rotate with tree
+            sockGroup.rotation.y = rotationY;
+            glowSystem.rotation.y = rotationY;
+
+            // Animate Star
+            starMesh.rotation.y = time * 0.3;
+            starMesh.rotation.z = Math.sin(time * 0.5) * 0.1;
+            const starPulse = 1 + Math.sin(time * 2) * 0.1;
+            starGlow.scale.set(12 * starPulse, 12 * starPulse, 1);
+            starMaterial.emissiveIntensity = 0.6 + Math.sin(time * 3) * 0.3;
+
+            // Update Foliage
+            const lP = foliageSystem.geometry.attributes.position.array;
+            const lT = foliageSystem.geometry.userData.targets;
+            const lE = foliageSystem.geometry.userData.expands;
+
+            for (let i = 0; i < CONFIG.leafCount; i++) {
+                const i3 = i * 3;
+                lP[i3] = lT[i3] + (lE[i3] - lT[i3]) * state.expansion;
+                lP[i3 + 1] = lT[i3 + 1] + (lE[i3 + 1] - lT[i3 + 1]) * state.expansion;
+                lP[i3 + 2] = lT[i3 + 2] + (lE[i3 + 2] - lT[i3 + 2]) * state.expansion;
+
+                // Wind effect on leaves
+                if (state.expansion < 0.1) lP[i3 + 1] += Math.sin(time * 1.5 + lP[i3]) * 0.03;
+            }
+            foliageSystem.geometry.attributes.position.needsUpdate = true;
+
+            // Update Original Decorations (reduced visibility since we have new systems)
+            const dP = decorSystem.geometry.attributes.position.array;
+            const dT = decorSystem.geometry.userData.targets;
+            const dE = decorSystem.geometry.userData.expands;
+
+            for (let i = 0; i < CONFIG.decorCount; i++) {
+                const i3 = i * 3;
+                dP[i3] = dT[i3] + (dE[i3] - dT[i3]) * state.expansion;
+                dP[i3 + 1] = dT[i3 + 1] + (dE[i3 + 1] - dT[i3 + 1]) * state.expansion;
+                dP[i3 + 2] = dT[i3 + 2] + (dE[i3 + 2] - dT[i3 + 2]) * state.expansion;
+            }
+            decorSystem.geometry.attributes.position.needsUpdate = true;
+
+            // Update Garland Lights with individual flicker
+            const gP = garlandSystem.geometry.attributes.position.array;
+            const gT = garlandSystem.geometry.userData.targets;
+            const gE = garlandSystem.geometry.userData.expands;
+            const gF = garlandSystem.geometry.userData.flicker;
+            const gC = garlandSystem.geometry.attributes.color.array;
+
+            // Sparkle burst: every 0.5 seconds, pick random lights to spike
+            sparkleTimer += delta;
+            if (sparkleTimer > 0.3) {
+                sparkleTimer = 0;
+                sparkleIndices.clear();
+                for (let j = 0; j < 10; j++) {
+                    sparkleIndices.add(Math.floor(Math.random() * CONFIG.lightCount));
+                }
+            }
+
+            for (let i = 0; i < CONFIG.lightCount; i++) {
+                const i3 = i * 3;
+                const f3 = i * 3;
+
+                // Position lerp
+                gP[i3] = gT[i3] + (gE[i3] - gT[i3]) * state.expansion;
+                gP[i3 + 1] = gT[i3 + 1] + (gE[i3 + 1] - gT[i3 + 1]) * state.expansion;
+                gP[i3 + 2] = gT[i3 + 2] + (gE[i3 + 2] - gT[i3 + 2]) * state.expansion;
+
+                // Per-light flicker (brightness modulation via color)
+                if (state.expansion < 0.1) {
+                    const phase = gF[f3];
+                    const speed = gF[f3 + 1];
+                    const minB = gF[f3 + 2];
+                    let brightness = minB + (1 - minB) * (0.5 + 0.5 * Math.sin(time * speed + phase));
+
+                    // Sparkle burst
+                    if (sparkleIndices.has(i)) {
+                        brightness = Math.min(1.5, brightness * 2);
+                    }
+
+                    // Modulate color brightness
+                    const baseColor = gC[i3] > 0.5 ? 1 : gC[i3] * 2;
+                    gC[i3] = Math.min(1, gC[i3] * brightness + 0.1);
+                    gC[i3 + 1] = Math.min(1, gC[i3 + 1] * brightness + 0.05);
+                    gC[i3 + 2] = Math.min(1, gC[i3 + 2] * brightness);
+                }
+            }
+            garlandSystem.geometry.attributes.position.needsUpdate = true;
+            garlandSystem.geometry.attributes.color.needsUpdate = true;
+
+            // Update 3D Ornaments
+            for (let i = 0; i < ornamentData.length; i++) {
+                const data = ornamentData[i];
+                data.mesh.position.lerpVectors(data.target, data.expand, state.expansion);
+
+                // Gentle sway
+                if (state.expansion < 0.1) {
+                    data.mesh.rotation.z = Math.sin(time * 0.8 + i) * 0.1;
+                    data.mesh.rotation.x = Math.sin(time * 0.6 + i * 0.5) * 0.05;
+                }
+            }
+
+            // Update Glow Aura
+            const glP = glowSystem.geometry.attributes.position.array;
+            const glT = glowSystem.geometry.userData.targets;
+            const glE = glowSystem.geometry.userData.expands;
+
+            for (let i = 0; i < CONFIG.glowParticles; i++) {
+                const i3 = i * 3;
+                glP[i3] = glT[i3] + (glE[i3] - glT[i3]) * state.expansion;
+                glP[i3 + 1] = glT[i3 + 1] + (glE[i3 + 1] - glT[i3 + 1]) * state.expansion;
+                glP[i3 + 2] = glT[i3 + 2] + (glE[i3 + 2] - glT[i3 + 2]) * state.expansion;
+
+                // Slow drift
+                if (state.expansion < 0.1) {
+                    glP[i3] += Math.sin(time * 0.3 + i) * 0.02;
+                    glP[i3 + 1] += Math.sin(time * 0.2 + i * 0.7) * 0.02;
+                }
+            }
+            glowSystem.geometry.attributes.position.needsUpdate = true;
+
+            // Pulsing glow opacity
+            glowMat.opacity = 0.25 + Math.sin(time * 0.5) * 0.05; // Base 0.25 for brightness
+
+            // Update Gifts
+            for (let i = 0; i < giftData.length; i++) {
+                const data = giftData[i];
+                data.mesh.position.lerpVectors(data.target, data.expand, state.expansion);
+            }
+
+            // Update Socks
+            for (let i = 0; i < sockData.length; i++) {
+                const data = sockData[i];
+                data.mesh.position.lerpVectors(data.target, data.expand, state.expansion);
+                if (state.expansion < 0.1) {
+                    // Gentle sway when resting
+                    data.mesh.rotation.z = 0.2 + Math.sin(time * 3 + i) * 0.1;
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // --- HAND TRACKING ---
+        const videoElement = document.getElementById('input_video');
+
+        function onResults(results) {
+            document.getElementById('loading').style.display = 'none';
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length === 2) {
+                const h1 = results.multiHandLandmarks[0][9];
+                const h2 = results.multiHandLandmarks[1][9];
+                const dist = Math.sqrt(Math.pow(h1.x - h2.x, 2) + Math.pow(h1.y - h2.y, 2));
+                state.targetExpansion = Math.max(0, Math.min(1, (dist - 0.1) * 2.5));
+            } else {
+                state.targetExpansion = 0;
+            }
+        }
+
+        const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+        hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        hands.onResults(onResults);
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({ image: videoElement }); },
+            width: 640, height: 480
+        });
+        cameraUtils.start();
+
+        // --- UI ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        document.getElementById('colorPicker').addEventListener('input', (e) => {
+            state.leafColor.set(e.target.value);
+            // Foliage material auto-updates because it references state.leafColor obj directly? 
+            // Actually needed to re-assign for safety or if object ref changes
+            foliageSystem.material.color.set(e.target.value);
+        });
+
+    </script>
+</body>
+
+</html>
