@@ -124,7 +124,12 @@
         let state = {
             expansion: 0,
             targetExpansion: 0,
-            leafColor: new THREE.Color('#44ffaa')
+            leafColor: new THREE.Color('#44ffaa'),
+            handCentroid: { x: 0.5, y: 0.5 },
+            targetCentroid: { x: 0.5, y: 0.5 },
+            handVelocity: 0,
+            targetVelocity: 0,
+            staticRotation: 0 // Accumulates rotation when hands are present
         };
 
         // --- THREE.JS SETUP ---
@@ -713,18 +718,62 @@
             const smoothFactor = 4.0 * delta;
             state.expansion += (state.targetExpansion - state.expansion) * smoothFactor;
 
-            // Rotation - sync all systems
-            const rotationY = time * 0.05;
-            foliageSystem.rotation.y = rotationY;
-            decorSystem.rotation.y = rotationY;
-            garlandSystem.rotation.y = rotationY;
-            ornamentGroup.rotation.y = rotationY;
-            giftGroup.rotation.y = rotationY; // Decor on ground rotates with tree or separate? Let's rotate with tree
-            sockGroup.rotation.y = rotationY;
-            glowSystem.rotation.y = rotationY;
+            // Rotation Logic - Hybrid
+            // 1. Auto-rotation when idle (no hands)
+            // 2. Controlled rotation when hands are present
+
+            const isInteracting = state.targetExpansion > 0.05 || Math.abs(state.handVelocity) > 0.01;
+
+            // Smooth centroid
+            const smoothCentroid = 5.0 * delta;
+            state.handCentroid.x += (state.targetCentroid.x - state.handCentroid.x) * smoothCentroid;
+            state.handCentroid.y += (state.targetCentroid.y - state.handCentroid.y) * smoothCentroid;
+
+            // Velocity smoothing
+            state.handVelocity += (state.targetVelocity - state.handVelocity) * smoothFactor;
+            state.targetVelocity *= 0.9; // Decay target velocity
+
+            // Calculate Rotation
+            // Map X (0..1) to (-1..1), if hands are active, rotate based on offset from center
+            let rotSpeed = 0.05; // Default slow spin
+            if (isInteracting) {
+                const rotOffset = (state.handCentroid.x - 0.5) * 5.0; // -2.5 to 2.5 speed
+                rotSpeed = rotOffset;
+            }
+            // Accumulate rotation
+            state.staticRotation += rotSpeed * delta;
+
+            // Tilt Logic
+            // Map Y (1..0 because 0 is top) to Tilt Angle (looking up/down)
+            // 0 (top) -> Look Up (+ tilt)
+            // 1 (bottom) -> Look Down (- tilt)
+            const tiltOffset = (state.handCentroid.y - 0.5) * 0.5; // -0.25 to 0.25 radians
+
+            // Apply Transforms
+
+            // 1. Rotate Elements (Keep lights static for dynamic shadows)
+            foliageSystem.rotation.y = state.staticRotation;
+            decorSystem.rotation.y = state.staticRotation;
+            garlandSystem.rotation.y = state.staticRotation;
+            ornamentGroup.rotation.y = state.staticRotation;
+            giftGroup.rotation.y = state.staticRotation;
+            sockGroup.rotation.y = state.staticRotation;
+            glowSystem.rotation.y = state.staticRotation;
+
+            // 2. Tilt (Move Camera)
+            // Hand Y: 0(Top) -> Camera High (25). Y: 1(Bottom) -> Camera Low (-15).
+            // Lerp camera for smoothness
+            const targetCamY = 5 + (0.5 - state.handCentroid.y) * 40;
+            camera.position.y += (targetCamY - camera.position.y) * 4.0 * delta;
+            camera.lookAt(0, 8, 0);
+
+            // Scene rotation NOT used, to preserve floor/lights
+            scene.rotation.y = 0;
+            scene.rotation.x = 0;
 
             // Animate Star
-            starMesh.rotation.y = time * 0.3;
+            // Star spins independently (time * 0.3) PLUS tree rotation
+            starMesh.rotation.y = state.staticRotation + time * 0.3;
             starMesh.rotation.z = Math.sin(time * 0.5) * 0.1;
             const starPulse = 1 + Math.sin(time * 2) * 0.1;
             starGlow.scale.set(12 * starPulse, 12 * starPulse, 1);
@@ -766,13 +815,28 @@
             const gF = garlandSystem.geometry.userData.flicker;
             const gC = garlandSystem.geometry.attributes.color.array;
 
-            // Sparkle burst: every 0.5 seconds, pick random lights to spike
+            // Sparkle burst: Triggered by VELOCITY now, or timer fallback
             sparkleTimer += delta;
+
+            // Check for high velocity wave
+            if (state.handVelocity > 0.05) {
+                // Add random sparkles based on how fast
+                const count = Math.floor(state.handVelocity * 50);
+                for (let j = 0; j < count; j++) {
+                    sparkleIndices.add(Math.floor(Math.random() * CONFIG.lightCount));
+                }
+            }
+
             if (sparkleTimer > 0.3) {
                 sparkleTimer = 0;
-                sparkleIndices.clear();
-                for (let j = 0; j < 10; j++) {
-                    sparkleIndices.add(Math.floor(Math.random() * CONFIG.lightCount));
+                // Always keep a few active
+                if (sparkleIndices.size < 5) {
+                    for (let j = 0; j < 5; j++) {
+                        sparkleIndices.add(Math.floor(Math.random() * CONFIG.lightCount));
+                    }
+                } else {
+                    // Decay old ones if not moving
+                    if (Math.random() > 0.5) sparkleIndices.clear();
                 }
             }
 
@@ -864,15 +928,53 @@
         // --- HAND TRACKING ---
         const videoElement = document.getElementById('input_video');
 
+        let prevCentroid = { x: 0.5, y: 0.5 };
+
         function onResults(results) {
             document.getElementById('loading').style.display = 'none';
-            if (results.multiHandLandmarks && results.multiHandLandmarks.length === 2) {
-                const h1 = results.multiHandLandmarks[0][9];
-                const h2 = results.multiHandLandmarks[1][9];
-                const dist = Math.sqrt(Math.pow(h1.x - h2.x, 2) + Math.pow(h1.y - h2.y, 2));
-                state.targetExpansion = Math.max(0, Math.min(1, (dist - 0.1) * 2.5));
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                // Calculate Centroid
+                let sumX = 0;
+                let sumY = 0;
+                let count = 0;
+
+                results.multiHandLandmarks.forEach(landmarks => {
+                    const lm = landmarks[9]; // Middle finger MCP
+                    sumX += lm.x;
+                    sumY += lm.y;
+                    count++;
+                });
+
+                const cx = sumX / count;
+                const cy = sumY / count;
+
+                // Calculate Expansion (as before, between two hands if present)
+                if (results.multiHandLandmarks.length === 2) {
+                    const h1 = results.multiHandLandmarks[0][9];
+                    const h2 = results.multiHandLandmarks[1][9];
+                    const dist = Math.sqrt(Math.pow(h1.x - h2.x, 2) + Math.pow(h1.y - h2.y, 2));
+                    state.targetExpansion = Math.max(0, Math.min(1, (dist - 0.1) * 2.5));
+                } else {
+                    state.targetExpansion = 0;
+                }
+
+                // Calculate Velocity (Delta)
+                const dx = cx - prevCentroid.x;
+                const dy = cy - prevCentroid.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+
+                // Update Target State
+                state.targetCentroid = { x: cx, y: cy };
+                state.targetVelocity = dist; // Instant velocity, smoothed in animate()
+
+                prevCentroid = { x: cx, y: cy };
+
             } else {
                 state.targetExpansion = 0;
+                state.targetVelocity = 0;
+                // Slowly drift back to center if hands lost? Or stay put?
+                // Let's stay put to avoid jarring snaps, but drift slowly effectively resetting
+                state.targetCentroid = { x: 0.5, y: 0.5 };
             }
         }
 
